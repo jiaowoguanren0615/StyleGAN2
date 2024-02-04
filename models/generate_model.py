@@ -2,136 +2,14 @@ from math import log2
 from functools import partial
 
 import torch
-from torch import nn, einsum
+from torch import nn
 import torch.nn.functional as F
-
-from einops import rearrange
-from kornia.filters import filter2d
 
 from datasets import exists
 
+from .model_utils import leaky_relu, Blur, attn_and_ff
 
 
-def leaky_relu(p=0.2):
-    return nn.LeakyReLU(p, inplace=True)
-
-
-class Blur(nn.Module):
-    def __init__(self):
-        super().__init__()
-        f = torch.Tensor([1, 2, 1])
-        self.register_buffer('f', f)
-    def forward(self, x):
-        f = self.f
-        f = f[None, None, :] * f [None, :, None]
-        return filter2d(x, f, normalized=True)
-
-
-class Residual(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-    def forward(self, x):
-        return self.fn(x) + x
-
-class ChanNorm(nn.Module):
-    def __init__(self, dim, eps = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.b = nn.Parameter(torch.zeros(1, dim, 1, 1))
-
-    def forward(self, x):
-        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
-        mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) / (var + self.eps).sqrt() * self.g + self.b
-
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.fn = fn
-        self.norm = ChanNorm(dim)
-
-    def forward(self, x):
-        return self.fn(self.norm(x))
-
-
-# attention
-
-class DepthWiseConv2d(nn.Module):
-    def __init__(self, dim_in, dim_out, kernel_size, padding = 0, stride = 1, bias = True):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(dim_in, dim_in, kernel_size = kernel_size, padding = padding, groups = dim_in, stride = stride, bias = bias),
-            nn.Conv2d(dim_in, dim_out, kernel_size = 1, bias = bias)
-        )
-    def forward(self, x):
-        return self.net(x)
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim, dim_head = 64, heads = 8):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
-
-        self.nonlin = nn.GELU()
-        self.to_q = nn.Conv2d(dim, inner_dim, 1, bias = False)
-        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, padding = 1, bias = False)
-        self.to_out = nn.Conv2d(inner_dim, dim, 1)
-
-    def forward(self, fmap):
-        h, x, y = self.heads, *fmap.shape[-2:]
-        q, k, v = (self.to_q(fmap), *self.to_kv(fmap).chunk(2, dim = 1))
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) (x y) c', h = h), (q, k, v))
-
-        q = q.softmax(dim = -1)
-        k = k.softmax(dim = -2)
-
-        q = q * self.scale
-
-        context = einsum('b n d, b n e -> b d e', k, v)
-        out = einsum('b n d, b d e -> b n e', q, context)
-        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
-
-        out = self.nonlin(out)
-        return self.to_out(out)
-
-
-attn_and_ff = lambda chan: nn.Sequential(*[
-    Residual(PreNorm(chan, LinearAttention(chan))),
-    Residual(PreNorm(chan, nn.Sequential(nn.Conv2d(chan, chan * 2, 1), leaky_relu(), nn.Conv2d(chan * 2, chan, 1))))
-])
-
-
-
-class RGBBlock(nn.Module):
-    def __init__(self, latent_dim, input_channel, upsample, rgba = False):
-        super().__init__()
-        self.input_channel = input_channel
-        self.to_style = nn.Linear(latent_dim, input_channel)
-
-        out_filters = 3 if not rgba else 4
-        self.conv = Conv2DMod(input_channel, out_filters, 1, demod=False)
-
-        self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor = 2, mode='bilinear', align_corners=False),
-            Blur()
-        ) if upsample else None
-
-    def forward(self, x, prev_rgb, istyle):
-        b, c, h, w = x.shape
-        style = self.to_style(istyle)
-        x = self.conv(x, style)
-
-        if exists(prev_rgb):
-            x = x + prev_rgb
-
-        if exists(self.upsample):
-            x = self.upsample(x)
-
-        return x
 
 class Conv2DMod(nn.Module):
     def __init__(self, in_chan, out_chan, kernel, demod=True, stride=1, dilation=1, eps = 1e-8, **kwargs):
@@ -168,6 +46,35 @@ class Conv2DMod(nn.Module):
         x = F.conv2d(x, weights, padding=padding, groups=b)
 
         x = x.reshape(-1, self.filters, h, w)
+        return x
+
+
+
+class RGBBlock(nn.Module):
+    def __init__(self, latent_dim, input_channel, upsample, rgba = False):
+        super().__init__()
+        self.input_channel = input_channel
+        self.to_style = nn.Linear(latent_dim, input_channel)
+
+        out_filters = 3 if not rgba else 4
+        self.conv = Conv2DMod(input_channel, out_filters, 1, demod=False)
+
+        self.upsample = nn.Sequential(
+            nn.Upsample(scale_factor = 2, mode='bilinear', align_corners=False),
+            Blur()
+        ) if upsample else None
+
+    def forward(self, x, prev_rgb, istyle):
+        b, c, h, w = x.shape
+        style = self.to_style(istyle)
+        x = self.conv(x, style)
+
+        if exists(prev_rgb):
+            x = x + prev_rgb
+
+        if exists(self.upsample):
+            x = self.upsample(x)
+
         return x
 
 
